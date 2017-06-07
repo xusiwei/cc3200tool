@@ -184,8 +184,23 @@ class CC3x00VersionInfo(object):
         self.chip_type = chip_type
 
     @property
-    def is_cc3200(self):
+    def is_cc32xx(self):
         return (self.chip_type[0] & 0x10) != 0
+    @property
+    def is_cc3220(self):
+        return (self.chip_type[0] == 0x10)
+    @property
+    def is_cc3220s(self):
+        return (self.chip_type[0] == 0x18)
+    @property
+    def is_cc3220sf(self):
+        return (self.chip_type[0] == 0x19)
+    @property
+    def chip_name(self):
+        if self.is_cc3220: return "CC3220"
+        if self.is_cc3220s: return "CC3220S"
+        if self.is_cc3220sf: return "CC3220SF"
+        return "CC3210"
 
     @classmethod
     def from_packet(cls, data):
@@ -278,6 +293,7 @@ class CC3200Connection(object):
 
         self.vinfo = None
         self.vinfo_apps = None
+        self.sram_info = None
 
     @contextmanager
     def _serial_timeout(self, timeout=None):
@@ -381,16 +397,18 @@ class CC3200Connection(object):
         log.debug("get last status got %s", hexify(status))
         return CC3x00Status(ord(status))
 
-    def _do_break(self, timeout):
-        self.port.send_break(.2)
+    def _do_break(self, timeout, duration):
+        # self.port.send_break(duration)
+        self.port.break_condition = True
+        time.sleep(duration)
+        self.port.break_condition = False
         return self._read_ack(timeout)
 
-    def _try_breaking(self, tries=5, timeout=2):
+    def _try_breaking(self, tries=5, timeout=2, duration=.25):
         for _ in range(tries):
-            if self._do_break(timeout):
-                break
-        else:
-            raise CC3200Error("Did not get ACK on break condition")
+            if self._do_break(timeout, duration):
+                return True
+        return False
 
     def _get_version(self):
         self._send_packet(OPCODE_GET_VERSION_INFO)
@@ -424,7 +442,7 @@ class CC3200Connection(object):
     def _erase_blocks(self, start, count, storage_id=0):
         command = OPCODE_RAW_STORAGE_ERASE + \
             struct.pack(">III", storage_id, start, count)
-        self._send_packet()
+        self._send_packet(command)
 
     def _send_chunk(self, offset, data, storage_id=0):
         command = OPCODE_RAW_STORAGE_WRITE + \
@@ -518,9 +536,14 @@ class CC3200Connection(object):
         self.port.flushInput()
         self._set_sop2(True)
         self._do_reset()
-        self._try_breaking(tries=5, timeout=2)
+        if not self._try_breaking(tries=5, timeout=2):
+            raise CC3200Error("Did not get ACK on break condition")
         log.info("Connected, reading version...")
+
+    def detect_target_type(self):
         self.vinfo = self._get_version()
+        log.info("got version ACK: %s", self.vinfo)
+        log.info("This is a %s device", self.vinfo.chip_name)
 
     def switch_to_nwp_bootloader(self):
         log.info("Switching to NWP bootloader...")
@@ -529,7 +552,8 @@ class CC3200Connection(object):
             log.debug("This looks like the NWP already")
             return
 
-        if vinfo.bootloader[1] < 3:
+        log.info("vinfo: " + str(vinfo))
+        if not vinfo.is_cc32xx:
             raise CC3200Error("Unsupported device")
 
         if vinfo.bootloader[1] == 3:
@@ -543,23 +567,25 @@ class CC3200Connection(object):
             # should upload rbtl3100.dll
             raise CC3200Error("Not yet supported device (NWP bootloader=3)")
 
-        if vinfo.bootloader[1] >= 4:
-            log.info("Uploading rbtl3100s.dll...")
-            self._raw_write(0, dll_data('rbtl3100s.dll'))
-            self._exec_from_ram()
-
-        if not self._read_ack():
-            raise CC3200Error("got no ACK after exec from ram")
-
     def switch_uart_to_apps(self):
         # ~ 1 sec delay by the APPS MCU
         log.info("Switching UART to APPS...")
         command = OPCODE_SWITCH_2_APPS + struct.pack(">I", 26666667)
         self._send_packet(command)
         log.info("Resetting communications ...")
-        time.sleep(1)
-        self._try_breaking()
-        self.vinfo_apps = self._get_version()
+        if not self._try_breaking(5, 1, 1.0):
+            raise CC3200Error("no ACK after Switch UART to APPS MCU command")
+        else:
+            log.info('got ACK after Switch UART to APPS MCU command')
+
+    def get_sram_storage_info(self):
+        self.sram_info = self._get_storage_info(storage_id=0) 
+        log.info('got SRAM storage info: ' + str(self.sram_info) + ', response ACK')
+        # self._send_ack()
+
+    def erase_sram_storage(self):
+        self._erase_blocks(0, self.sram_info.block_count, storage_id=0) 
+        log.info('erased all SRAM blocks')
 
     def format_slfs(self, size=None):
         if size is None:
@@ -721,7 +747,6 @@ def main():
         sys.exit(-3)
 
     port_name = args.port
-
     try:
         p = serial.Serial(
             port_name, baudrate=CC3200_BAUD, parity=serial.PARITY_NONE,
@@ -732,20 +757,21 @@ def main():
 
     cc = CC3200Connection(p, reset_method, sop2_method)
     try:
-        cc.connect()
+        cc.connect() # step 1
         log.info("connected to target")
     except (Exception, ) as e:
         log.error("Could not connect to target: {}".format(e))
         sys.exit(-3)
 
-    log.info("Version: %s", cc.vinfo)
-
     # TODO: sane error handling
+    cc.detect_target_type() # step 2
 
-    if cc.vinfo.is_cc3200:
-        log.info("This is a CC3200 device")
-        cc.switch_to_nwp_bootloader()
+    if cc.vinfo.is_cc32xx:
+        cc.switch_to_nwp_bootloader() # step 3
         log.info("APPS version: %s", cc.vinfo_apps)
+
+    cc.get_sram_storage_info() # step 4
+    cc.erase_sram_storage() # step 5
 
     for command in commands:
         if command.cmd == "format_flash":
