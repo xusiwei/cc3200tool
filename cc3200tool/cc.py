@@ -1,4 +1,3 @@
-#
 # cc3200tool - work with TI's CC3200 SimpleLink (TM) filesystem.
 # Copyright (C) 2016 Allterco Robotics
 #
@@ -33,6 +32,7 @@ import serial
 log = logging.getLogger()
 logging.basicConfig(stream=sys.stderr, level=logging.INFO,
                     format="%(asctime)-15s -- %(message)s")
+CURRENT_PATH = os.path.dirname(os.path.realpath(__file__))
 
 CC3200_BAUD = 921600
 
@@ -51,6 +51,7 @@ OPCODE_RAW_STORAGE_ERASE = "\x30"
 OPCODE_GET_STORAGE_INFO = "\x31"
 OPCODE_EXEC_FROM_RAM = "\x32"
 OPCODE_SWITCH_2_APPS = "\x33"
+OPCODE_FS_PROGRAMMING = "\x34"
 
 FLASH_BLOCK_SIZES = [0x100, 0x400, 0x1000, 0x4000, 0x10000]
 
@@ -163,13 +164,19 @@ parser_write_flash.add_argument(
         "image_file", type=argparse.FileType('rb'),
         help="gang image file prepared with Uniflash")
 parser_write_flash.add_argument(
-        "--no-erase", type=bool, default=False,
-        help="do not perform an erase before write (for blank chips)")
+        "--key", type=argparse.FileType('rb'), default=None,
+        help="the image encrypting key")
 
+
+def load_file(fname):
+    data = []
+    with open(fname, 'r') as f:
+        data = f.read()
+        assert len(data) > 0
+    return data
 
 def dll_data(fname):
     return get_data('cc3200tool', 'dll/{}'.format(fname))
-
 
 class CC3200Error(Exception):
     pass
@@ -294,6 +301,9 @@ class CC3200Connection(object):
         self.vinfo = None
         self.vinfo_apps = None
         self.sram_info = None
+        self.sflash_info = None
+        self.storage_list = None
+        self.storage_infos = {}
 
     @contextmanager
     def _serial_timeout(self, timeout=None):
@@ -449,12 +459,25 @@ class CC3200Connection(object):
             struct.pack(">III", storage_id, offset, len(data))
         self._send_packet(command + data)
 
+    def _fs_programming(self, flags, chunk, key=''):
+        command = OPCODE_FS_PROGRAMMING + \
+            struct.pack(">HHI", len(key), len(chunk), flags)
+        #log.info('FS programming header: %s', hexify(command + key))
+        self._send_packet(command + key + chunk)
+        response = self.port.read(4)
+        assert len(response) == 4
+        status = 0
+        for b in response:
+            status = (status << 8) + ord(b)
+        #log.info('FS programming request: %d, response %s: %d', len(chunk), hexify(response), status)
+        return status
+
     def _raw_write(self, offset, data, storage_id=0):
         slist = self._get_storage_list()
         if not slist.sflash:
             raise CC3200Error("no serial flash?!")
 
-        sinfo = self._get_storage_info()
+        sinfo = self._get_storage_info(storage_id)
         bs = sinfo.block_size
         if bs > 0:
             start = offset / bs
@@ -538,7 +561,9 @@ class CC3200Connection(object):
         self._do_reset()
         if not self._try_breaking(tries=5, timeout=2):
             raise CC3200Error("Did not get ACK on break condition")
-        log.info("Connected, reading version...")
+        log.info("Connected, get storage list...")
+        self.storage_list = self._get_storage_list()
+        log.info('Get Storage List:' + str(self.storage_list))
 
     def detect_target_type(self):
         self.vinfo = self._get_version()
@@ -547,25 +572,28 @@ class CC3200Connection(object):
 
     def switch_to_nwp_bootloader(self):
         log.info("Switching to NWP bootloader...")
-        vinfo = self._get_version()
-        if not vinfo.is_cc3200:
+        if not self.vinfo or not self.vinfo.is_cc32xx:
             log.debug("This looks like the NWP already")
             return
 
-        log.info("vinfo: " + str(vinfo))
-        if not vinfo.is_cc32xx:
+        log.info("vinfo: " + str(self.vinfo))
+        if not self.vinfo.is_cc32xx:
             raise CC3200Error("Unsupported device")
 
-        if vinfo.bootloader[1] == 3:
+        if self.vinfo.bootloader[1] == 3:
             # cesanta upload and exec rbtl3101_132.dll for this version
             # then do the UART switch
             raise CC3200Error("Not yet supported device (bootloader=3)")
 
         self.switch_uart_to_apps()
 
-        if vinfo.bootloader[1] == 3:
+        if self.vinfo.bootloader[1] == 3:
             # should upload rbtl3100.dll
             raise CC3200Error("Not yet supported device (NWP bootloader=3)")
+
+        for i in range(8):
+            self.vinfo_apps = self._get_version()
+
 
     def switch_uart_to_apps(self):
         # ~ 1 sec delay by the APPS MCU
@@ -578,14 +606,35 @@ class CC3200Connection(object):
         else:
             log.info('got ACK after Switch UART to APPS MCU command')
 
-    def get_sram_storage_info(self):
-        self.sram_info = self._get_storage_info(storage_id=0) 
-        log.info('got SRAM storage info: ' + str(self.sram_info) + ', response ACK')
-        # self._send_ack()
+    def get_storage_info(self, storage_id):
+        sinfo = self._get_storage_info(storage_id)
+        log.info('got stroage %d info: %s', storage_id, str(sinfo))
+        self.storage_infos[storage_id] = sinfo
 
-    def erase_sram_storage(self):
-        self._erase_blocks(0, self.sram_info.block_count, storage_id=0) 
-        log.info('erased all SRAM blocks')
+    def erase_raw_storage(self, storage_id, start, count):
+        log.info('erasing storage %d, start: %d, blocks: %d', storage_id, start, count)
+        self._erase_blocks(start, count, storage_id)
+        s = self._get_last_status()
+        if not s.is_ok:
+            raise CC3200Error('Raw Storage Erase failed, storage_id: 0')
+
+    def write_raw_storage(self, storage_id, offset, data):
+        log.info('writting %d bytes to storage %d+%d...', len(data), storage_id, offset)
+        chunk_size = 4080
+        sent = 0
+        while sent < len(data):
+            chunk = data[sent:sent+chunk_size]
+            self._send_chunk(offset + sent, chunk, storage_id)
+            s = self._get_last_status()
+            if not s.is_ok:
+                raise CC3200Error('Raw Stroage Write failed, sent: %d', sent)
+            else:
+                log.info('file chunk %d: %d write success', sent, len(chunk))
+            sent += len(chunk)
+        s = self._get_last_status()
+        if not s.is_ok:
+            raise CC3200Error('Raw Stroage Write failed, sent: %d', sent)
+        log.info('write %d bytes to storage %d+%d success', len(data), storage_id, offset)
 
     def format_slfs(self, size=None):
         if size is None:
@@ -640,6 +689,7 @@ class CC3200Connection(object):
                     SLFS_FILE_PUBLIC_READ)
 
         finfo = self._get_file_info(cc_filename)
+        log.info('get file info: ' + str(finfo))
         if finfo.exists:
             log.info("File exists on target, erasing")
             self.erase_file(cc_filename)
@@ -695,16 +745,29 @@ class CC3200Connection(object):
 
         self._close_file()
 
-    def write_flash(self, image, erase=True):
+    def write_flash(self, image, key):
         data = image.read()
         data_len = len(data)
-        if erase:
-            count = int(math.ceil(data_len / float(SLFS_BLOCK_SIZE)))
-            self._erase_blocks(0, count, storage_id=2)
+        log.info('flash image size: %d', data_len)
 
-        self._raw_write(8, data[8:], storage_id=2)
-        self._raw_write(0, data[:8], storage_id=2)
-
+        flags = 0
+        key_data = ''
+        key_size = 0
+        chunk_size = 4096
+        if key:
+            key_size = 16
+            key_data = key.read()[:16]
+        sent = 0
+        while sent < data_len:
+            chunk = data[sent: sent + chunk_size]
+            status = self._fs_programming(flags, chunk, key_data)
+            # assert (len(chunk) == chunk_size and status == sent) or status == 0
+            log.info('FS programming chunk %d:%d, status %d', sent, len(chunk), status)
+            sent += len(chunk)
+        if data_len % chunk_size == 0:
+            status = self._fs_programming(flags, '', '')
+            log.info('FS programming status %d', status)
+            # assert status == 0
 
 def split_argv(cmdline_args):
     """Manually split sys.argv into subcommand sections
@@ -770,8 +833,19 @@ def main():
         cc.switch_to_nwp_bootloader() # step 3
         log.info("APPS version: %s", cc.vinfo_apps)
 
-    cc.get_sram_storage_info() # step 4
-    cc.erase_sram_storage() # step 5
+    cc.get_storage_info(0) # step 4
+    cc.erase_raw_storage(0, 0, 3) # step 5
+
+    sram_patches = os.path.join(CURRENT_PATH, 'dll/gen2/BTL_ram.ptc')
+    cc.write_raw_storage(0, 0, load_file(sram_patches)) # step 6
+    cc._exec_from_ram() # step 7, initialization is completed.
+    if not cc._read_ack():
+        raise CC3200Error('no second ACK after execute from RAM command')
+
+    cc.get_storage_info(2) # step 8
+    cc.erase_raw_storage(2, 33, 2) # step 9
+    sflash_patches = os.path.join(CURRENT_PATH, 'dll/gen2/BTL_sflash.ptc')
+    cc.write_raw_storage(2, 33*4096+8, load_file(sflash_patches)) # step 10
 
     for command in commands:
         if command.cmd == "format_flash":
@@ -789,7 +863,7 @@ def main():
             cc.erase_file(command.filename)
 
         if command.cmd == "write_flash":
-            cc.write_flash(command.image_file, not command.no_erase)
+            cc.write_flash(command.image_file, command.key)
 
     log.info("All commands done, bye.")
 
